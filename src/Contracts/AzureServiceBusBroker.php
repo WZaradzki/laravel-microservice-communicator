@@ -7,6 +7,7 @@ use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Log;
 use WZaradzki\MicroserviceCommunicator\Brokers\MessageBrokerInterface;
 use WZaradzki\MicroserviceCommunicator\Exceptions\BrokerException;
+use WZaradzki\MicroserviceCommunicator\Messages\ServiceBusMessage;
 
 class AzureServiceBusBroker implements MessageBrokerInterface
 {
@@ -28,11 +29,6 @@ class AzureServiceBusBroker implements MessageBrokerInterface
     {
         $this->validateConfig($config);
 
-        $this->client = new Client([
-            'base_uri' => rtrim($config['endpoint'], '/'),
-            'timeout' => 30
-        ]);
-
         $this->baseUrl = $config['endpoint'];
         $this->keyName = $config['shared_access_key_name'];
         $this->key = $config['shared_access_key'];
@@ -44,6 +40,12 @@ class AzureServiceBusBroker implements MessageBrokerInterface
         }
 
         $this->refreshSasToken();
+
+        $this->client = new Client([
+            'base_uri' => rtrim($config['endpoint'], '/'),
+            'timeout' => 30,
+            'headers' => $this->getHeaders()
+        ]);
     }
 
     /**
@@ -93,7 +95,6 @@ class AzureServiceBusBroker implements MessageBrokerInterface
             $response = $this->client->post(
                 $this->buildUrl($queueName, 'messages'),
                 [
-                    'headers' => $this->getHeaders(),
                     'json' => $message,
                 ]
             );
@@ -123,14 +124,28 @@ class AzureServiceBusBroker implements MessageBrokerInterface
                     continue;
                 }
 
-                $this->processMessage($queueName, $message, $callback);
+                try {
+                    $serviceBusMessage = new ServiceBusMessage(
+                        $this->client,
+                        $queueName,
+                        $message['lockToken'],
+                        $message['properties']['MessageId'],
+                        $message['body'],
+                        $message['properties'],
+                        $this->logger
+                    );
 
-            } catch (BrokerException $e) {
-                $this->logger->error("Message processing error", [
-                    'queue' => $queueName,
-                    'error' => $e->getMessage()
-                ]);
-                sleep(self::RETRY_DELAY);
+                    // Pass the ServiceBusMessage instance to the callback
+                    $callback($serviceBusMessage);
+                } catch (\Exception $e) {
+                    $this->logger->error("Error processing message", [
+                        'queue' => $queueName,
+                        'messageId' => $message['properties']['MessageId'] ?? 'unknown',
+                        'error' => $e->getMessage(),
+                        'trace' => $e->getTraceAsString()
+                    ]);
+                }
+
             } catch (\Exception $e) {
                 $this->logger->error("Unexpected error in subscription", [
                     'queue' => $queueName,
@@ -142,6 +157,7 @@ class AzureServiceBusBroker implements MessageBrokerInterface
         }
     }
 
+
     /**
      * @throws BrokerException
      */
@@ -150,7 +166,6 @@ class AzureServiceBusBroker implements MessageBrokerInterface
         try {
             $response = $this->client->post(
                 $this->buildUrl($queueName, 'messages/head'),
-                ['headers' => $this->getHeaders()]
             );
 
             if ($response->getStatusCode() === 204) {
