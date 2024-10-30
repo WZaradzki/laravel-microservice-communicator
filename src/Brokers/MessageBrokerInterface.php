@@ -4,6 +4,6 @@ namespace WZaradzki\MicroserviceCommunicator\Brokers;
 
 interface MessageBrokerInterface
 {
-    public function publish(string $topic, array $message): bool;
-    public function subscribe(string $topic, callable $callback): void;
+    public function publish(string $queueName, array $message): bool;
+    public function subscribe(string $queueName, callable $callback): void;
 }

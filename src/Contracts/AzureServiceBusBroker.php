@@ -3,31 +3,76 @@
 namespace WZaradzki\MicroserviceCommunicator\Contracts;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Facades\Log;
 use WZaradzki\MicroserviceCommunicator\Brokers\MessageBrokerInterface;
 use WZaradzki\MicroserviceCommunicator\Exceptions\BrokerException;
-
 
 class AzureServiceBusBroker implements MessageBrokerInterface
 {
     private Client $client;
     private string $baseUrl;
     private string $sasToken;
+    private string $keyName;
+    private string $key;
+    private const TOKEN_EXPIRY_TIME = 3600; // 1 hour
+    private const RETRY_DELAY = 5; // seconds
+    private const EMPTY_QUEUE_DELAY = 1; // second
 
-    public function __construct(array $config)
+    private mixed $logger;
+
+    /**
+     * @throws BrokerException
+     */
+    public function __construct(array $config, mixed $logger = null)
     {
-        $this->client = new Client();
+        $this->validateConfig($config);
+
+        $this->client = new Client([
+            'base_uri' => rtrim($config['endpoint'], '/'),
+            'timeout' => 30
+        ]);
+
         $this->baseUrl = $config['endpoint'];
+        $this->keyName = $config['shared_access_key_name'];
+        $this->key = $config['shared_access_key'];
+
+        if (!$logger) {
+            $this->logger = Log::getLogger();
+        } else {
+            $this->logger = $logger;
+        }
+
+        $this->refreshSasToken();
+    }
+
+    /**
+     * @throws BrokerException
+     */
+    private function validateConfig(array $config): void
+    {
+        $requiredKeys = ['endpoint', 'shared_access_key_name', 'shared_access_key'];
+
+        foreach ($requiredKeys as $key) {
+            if (empty($config[$key])) {
+                throw new BrokerException("Missing required configuration key: {$key}");
+            }
+        }
+    }
+
+    private function refreshSasToken(): void
+    {
         $this->sasToken = $this->generateSasToken(
-            $config['endpoint'],
-            $config['shared_access_key_name'],
-            $config['shared_access_key']
+            $this->baseUrl,
+            $this->keyName,
+            $this->key
         );
     }
 
     private function generateSasToken(string $resourceUri, string $keyName, string $key): string
     {
-        $expiry = time() + 3600; // Token valid for 1 hour
-        $stringToSign = urlencode($resourceUri) . "\n" . $expiry;
+        $expiry = time() + self::TOKEN_EXPIRY_TIME;
+        $stringToSign = urlencode($resourceUri)."\n".$expiry;
         $signature = base64_encode(hash_hmac('sha256', $stringToSign, $key, true));
 
         return sprintf(
@@ -39,66 +84,162 @@ class AzureServiceBusBroker implements MessageBrokerInterface
         );
     }
 
-    public function publish(string $topic, array $message): bool
+    /**
+     * @throws BrokerException
+     */
+    public function publish(string $queueName, array $message): bool
     {
         try {
             $response = $this->client->post(
-                "{$this->baseUrl}/{$topic}/messages",
+                $this->buildUrl($queueName, 'messages'),
                 [
-                    'headers' => [
-                        'Authorization' => $this->sasToken,
-                        'Content-Type' => 'application/json',
-                    ],
+                    'headers' => $this->getHeaders(),
                     'json' => $message,
                 ]
             );
 
-            return $response->getStatusCode() === 201;
-        } catch (\Exception $e) {
-            \Log::error("Azure Service Bus REST API publish error: " . $e->getMessage());
-            throw new BrokerException("Failed to publish message: " . $e->getMessage());
+            if ($response->getStatusCode() !== 201) {
+                throw new BrokerException(
+                    "Failed to publish message. Status code: {$response->getStatusCode()}"
+                );
+            }
+
+            return true;
+        } catch (GuzzleException $e) {
+            throw new BrokerException("Failed to publish message: ".$e->getMessage());
         }
     }
 
-    public function subscribe(string $topic, callable $callback): void
+    public function subscribe(string $queueName, callable $callback): void
     {
-        $subscriptionName = 'default';
+        $this->logger->info("Starting subscription", ['queue' => $queueName]);
 
         while (true) {
             try {
-                $response = $this->client->post(
-                    "{$this->baseUrl}/{$topic}/subscriptions/{$subscriptionName}/messages/head",
-                    [
-                        'headers' => [
-                            'Authorization' => $this->sasToken,
-                        ],
-                    ]
-                );
+                $message = $this->receiveMessage($queueName);
 
-                if ($response->getStatusCode() === 204) {
-                    sleep(1);
+                if ($message === null) {
+                    sleep(self::EMPTY_QUEUE_DELAY);
                     continue;
                 }
 
-                $message = json_decode($response->getBody()->getContents(), true);
-                $lockToken = $response->getHeader('BrokerProperties')[0] ?? null;
+                $this->processMessage($queueName, $message, $callback);
 
-                if ($lockToken) {
-                    $callback($message);
-
-                    $this->client->delete(
-                        "{$this->baseUrl}/{$topic}/subscriptions/{$subscriptionName}/messages/{$lockToken}",
-                        [
-                            'headers' => [
-                                'Authorization' => $this->sasToken,
-                            ],
-                        ]
-                    );
-                }
+            } catch (BrokerException $e) {
+                $this->logger->error("Message processing error", [
+                    'queue' => $queueName,
+                    'error' => $e->getMessage()
+                ]);
+                sleep(self::RETRY_DELAY);
             } catch (\Exception $e) {
-                Log::error("Azure Service Bus REST API subscribe error: " . $e->getMessage());
-                sleep(5);
+                $this->logger->error("Unexpected error in subscription", [
+                    'queue' => $queueName,
+                    'error' => $e->getMessage(),
+                    'trace' => $e->getTraceAsString()
+                ]);
+                sleep(self::RETRY_DELAY);
             }
         }
+    }
+
+    /**
+     * @throws BrokerException
+     */
+    private function receiveMessage(string $queueName): ?array
+    {
+        try {
+            $response = $this->client->post(
+                $this->buildUrl($queueName, 'messages/head'),
+                ['headers' => $this->getHeaders()]
+            );
+
+            if ($response->getStatusCode() === 204) {
+                return null;
+            }
+
+            if ($response->getStatusCode() !== 201) {
+                throw new BrokerException(
+                    "Failed to receive message. Status code: {$response->getStatusCode()}"
+                );
+            }
+
+            $brokerProperties = $this->extractBrokerProperties($response);
+
+            return [
+                'body' => json_decode($response->getBody()->getContents(), true),
+                'lockToken' => $brokerProperties['LockToken'] ?? null,
+                'properties' => $brokerProperties
+            ];
+
+        } catch (GuzzleException $e) {
+            throw new BrokerException("Failed to receive message: ".$e->getMessage());
+        }
+    }
+
+    /**
+     * @throws BrokerException
+     */
+    private function processMessage(string $queueName, array $message, callable $callback): void
+    {
+        if (empty($message['lockToken'])) {
+            throw new BrokerException("Received message without lock token");
+        }
+
+        if (empty($message['properties']['MessageId'])) {
+            throw new BrokerException("Received message without MessageId");
+        }
+
+
+        try {
+            $callback($message['body']);
+            $this->completeMessage($queueName, $message['lockToken'], $message['properties']['MessageId']);
+        } catch (\Exception $e) {
+            $this->logger->error("Callback execution failed", [
+                'queue' => $queueName,
+                'error' => $e->getMessage(),
+                'messageId' => $message['properties']['MessageId'] ?? 'unknown'
+            ]);
+            throw new BrokerException("Callback execution failed: ".$e->getMessage());
+        }
+    }
+
+    /**
+     * @throws BrokerException
+     */
+    private function completeMessage(string $queueName, string $lockToken, string $messageId): void
+    {
+        try {
+            $response = $this->client->delete(
+                $this->buildUrl($queueName, "messages/{$messageId}/{$lockToken}"),
+                ['headers' => $this->getHeaders()]
+            );
+
+            if ($response->getStatusCode() !== 200) {
+                throw new BrokerException(
+                    "Failed to complete message. Status code: {$response->getStatusCode()}"
+                );
+            }
+        } catch (GuzzleException $e) {
+            throw new BrokerException("Failed to complete message: ".$e->getMessage());
+        }
+    }
+
+    private function buildUrl(string $queueName, string $path): string
+    {
+        return sprintf("/%s/%s", trim($queueName, '/'), trim($path, '/'));
+    }
+
+    private function getHeaders(): array
+    {
+        return [
+            'Authorization' => $this->sasToken,
+            'Content-Type' => 'application/json',
+        ];
+    }
+
+    private function extractBrokerProperties($response): array
+    {
+        $brokerPropertiesHeader = $response->getHeader('BrokerProperties')[0] ?? '{}';
+        return json_decode($brokerPropertiesHeader, true) ?? [];
     }
 }
